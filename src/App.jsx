@@ -1382,13 +1382,22 @@ function parseEurLexText(lines, docTitle) {
     // Table detection: lines with tabs
     if (/\t/.test(t) && !cls) {
       const tableRows = [];
+      let nonTabStreak = 0;
       while (i < lines.length) {
         const row = lines[i].trim();
-        if (!row || isEurLexNoise(row)) break;
-        if (!/\t/.test(row) && tableRows.length > 0) break;
+        if (!row || isEurLexNoise(row)) { if (tableRows.length > 0) break; i++; continue; }
+        if (classifyLine(row)) break; // stop at Article/Chapter headers
         if (/\t/.test(row)) {
           tableRows.push(row.split(/\t+/).map(c => c.trim()));
-        } else break;
+          nonTabStreak = 0;
+        } else {
+          nonTabStreak++;
+          if (nonTabStreak > 1) break; // 2 consecutive non-tab lines = end of table
+          // Single non-tab line might be a merged cell row
+          if (tableRows.length > 0) {
+            tableRows.push([row]); // single-cell row
+          } else break;
+        }
         i++;
       }
       i--;
@@ -1642,158 +1651,69 @@ async function loadPdfJs() {
 async function parseEurLexPdf(arrayBuffer) {
   const pdfjsLib = await loadPdfJs();
   const pdf = await pdfjsLib.getDocument({data:arrayBuffer}).promise;
-  const uid = () => "b" + Date.now() + "_" + Math.random().toString(36).slice(2,7);
+  const lines = [];
   
-  // Extract all text items with position info
-  const allItems = [];
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
     const content = await page.getTextContent();
-    const vp = page.getViewport({scale:1});
+    
+    // Group text items by Y coordinate into rows
+    const rowMap = new Map(); // y → [{x, text}]
     for (const item of content.items) {
-      if (!item.str.trim()) continue;
-      allItems.push({
-        text: item.str,
-        x: Math.round(item.transform[4]),
-        y: Math.round(vp.height - item.transform[5]),  // flip Y so top=0
-        page: p,
-        fontSize: Math.round(item.transform[0]) || 12,
-        width: item.width || 0,
-      });
+      if (!item.str || !item.str.trim()) continue;
+      const y = Math.round(item.transform[5]);
+      const x = Math.round(item.transform[4]);
+      // Find existing row within 3px
+      let rowKey = null;
+      for (const k of rowMap.keys()) {
+        if (Math.abs(k - y) <= 3) { rowKey = k; break; }
+      }
+      if (rowKey === null) rowKey = y;
+      if (!rowMap.has(rowKey)) rowMap.set(rowKey, []);
+      rowMap.get(rowKey).push({x, text: item.str});
     }
-  }
-
-  // Group items into rows by Y coordinate (items within 3px = same row)
-  const rows = [];
-  let currentRow = [];
-  let lastY = -999;
-  for (const item of allItems) {
-    if (Math.abs(item.y - lastY) > 3 && currentRow.length > 0) {
-      rows.push({y: lastY, items: currentRow.sort((a,b) => a.x - b.x)});
-      currentRow = [];
-    }
-    currentRow.push(item);
-    lastY = item.y;
-  }
-  if (currentRow.length > 0) rows.push({y: lastY, items: currentRow.sort((a,b) => a.x - b.x)});
-
-  // Detect table regions: consecutive rows with 2+ items at consistent X positions
-  const detectTableRegions = () => {
-    const regions = [];
-    let tableStart = -1;
-    let tableColCount = 0;
     
-    for (let ri = 0; ri < rows.length; ri++) {
-      const row = rows[ri];
-      const itemCount = row.items.length;
+    // Sort rows by Y (descending because PDF Y goes bottom-up)
+    const sortedRows = [...rowMap.entries()].sort((a, b) => b[0] - a[0]);
+    
+    for (const [y, items] of sortedRows) {
+      // Sort items left to right
+      items.sort((a, b) => a.x - b.x);
       
-      if (itemCount >= 2) {
-        // Check if X positions are spread across the page (not just inline text)
-        const xMin = Math.min(...row.items.map(it => it.x));
-        const xMax = Math.max(...row.items.map(it => it.x));
-        const spread = xMax - xMin;
-        
-        if (spread > 80) { // items spread across >80px = likely table row
-          if (tableStart < 0) {
-            tableStart = ri;
-            tableColCount = itemCount;
-          }
-        } else {
-          if (tableStart >= 0 && ri - tableStart >= 2) {
-            regions.push({start: tableStart, end: ri - 1});
-          }
-          tableStart = -1;
-        }
-      } else {
-        if (tableStart >= 0 && ri - tableStart >= 2) {
-          regions.push({start: tableStart, end: ri - 1});
-        }
-        tableStart = -1;
-      }
-    }
-    if (tableStart >= 0 && rows.length - tableStart >= 2) {
-      regions.push({start: tableStart, end: rows.length - 1});
-    }
-    return regions;
-  };
-
-  const tableRegions = detectTableRegions();
-  const tableRowSet = new Set();
-  tableRegions.forEach(r => { for (let i = r.start; i <= r.end; i++) tableRowSet.add(i); });
-
-  // Build output: lines for text, table blocks for table regions
-  const lines = [];
-  const inlineBlocks = []; // {afterLine: index, block: tableBlock}
-
-  for (let ri = 0; ri < rows.length; ri++) {
-    if (tableRowSet.has(ri)) {
-      // Find which region this belongs to
-      const region = tableRegions.find(r => ri >= r.start && ri <= r.end);
-      if (region && ri === region.start) {
-        // Detect column boundaries from all rows in this region
-        const allXPositions = [];
-        for (let tri = region.start; tri <= region.end; tri++) {
-          rows[tri].items.forEach(it => allXPositions.push(it.x));
-        }
-        // Cluster X positions into columns (within 20px = same column)
-        allXPositions.sort((a,b) => a - b);
-        const colBoundaries = [allXPositions[0]];
-        for (const x of allXPositions) {
-          if (x - colBoundaries[colBoundaries.length - 1] > 20) {
-            colBoundaries.push(x);
-          }
+      if (items.length >= 2) {
+        // Check for gaps between items that suggest table columns
+        let hasTableGaps = false;
+        for (let j = 1; j < items.length; j++) {
+          const gap = items[j].x - items[j-1].x - (items[j-1].text.length * 5); // rough char width
+          if (gap > 30) { hasTableGaps = true; break; }
         }
         
-        // Build table rows
-        const tableRows = [];
-        for (let tri = region.start; tri <= region.end; tri++) {
-          const cells = colBoundaries.map(() => "");
-          for (const item of rows[tri].items) {
-            // Find closest column
-            let closest = 0;
-            let minDist = Math.abs(item.x - colBoundaries[0]);
-            for (let ci = 1; ci < colBoundaries.length; ci++) {
-              const dist = Math.abs(item.x - colBoundaries[ci]);
-              if (dist < minDist) { minDist = dist; closest = ci; }
-            }
-            cells[closest] = (cells[closest] ? cells[closest] + " " : "") + item.text.trim();
+        if (hasTableGaps) {
+          // Join with tabs to preserve column structure
+          let line = items[0].text;
+          for (let j = 1; j < items.length; j++) {
+            const gap = items[j].x - items[j-1].x - (items[j-1].text.length * 5);
+            line += (gap > 30 ? "\t" : " ") + items[j].text;
           }
-          tableRows.push(cells.map(c => c.trim()));
-        }
-        
-        // Only add as table if it has meaningful content
-        if (tableRows.length >= 2 && tableRows.some(r => r.filter(c => c).length >= 2)) {
-          inlineBlocks.push({afterLine: lines.length, block: {id:uid(), type:"table", rows: tableRows}});
+          if (line.trim()) lines.push(line.trim());
+          continue;
         }
       }
-      continue; // skip table rows for line output
+      
+      // Regular line: join with spaces
+      const lineText = items.map(it => it.text).join(" ").trim();
+      if (lineText) lines.push(lineText);
     }
-    
-    // Regular text row: combine items into a single line
-    const lineText = rows[ri].items.map(it => it.text).join(" ").trim();
-    if (lineText) lines.push(lineText);
   }
-
+  
   // Detect title
   let docTitle = "EUR-Lex Import";
   for (const l of lines.slice(0, 20)) {
-    if (l.length > 20 && /(regulation|directive|verordening|richtlijn)/i.test(l)) { docTitle = l.slice(0,120); break; }
+    const clean = l.replace(/\t/g, " ");
+    if (clean.length > 20 && /(regulation|directive|verordening|richtlijn)/i.test(clean)) { docTitle = clean.slice(0,120); break; }
   }
-
-  // Parse text lines into blocks
-  const textBlocks = parseEurLexText(lines, docTitle);
-
-  // Insert table blocks at correct positions
-  if (inlineBlocks.length > 0) {
-    const sorted = [...inlineBlocks].sort((a,b) => b.afterLine - a.afterLine);
-    for (const tb of sorted) {
-      const ratio = lines.length > 0 ? tb.afterLine / lines.length : 1;
-      const insertAt = Math.min(Math.round(ratio * textBlocks.length), textBlocks.length);
-      textBlocks.splice(insertAt, 0, tb.block);
-    }
-  }
-
-  return {title: docTitle, blocks: textBlocks};
+  
+  return {title: docTitle, blocks: parseEurLexText(lines, docTitle)};
 }
 
 /* EUR-LEX IMPORT MODAL */

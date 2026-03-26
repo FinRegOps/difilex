@@ -2016,11 +2016,12 @@ function Reader({pages, secs, meta, onEdit, role, onLogout, T, onToggleDark, isD
   // Close mobile sidebar on page nav
   useEffect(()=>{if(scr.isMobile)setSideOpen(false)},[act]);
   const pg = pages[act];
-  useEffect(()=>{if(sRef.current){sRef.current.scrollTop=0;setScrollPct(0)};setSummaryLoading(false);setNoteOpen(false);updateSEO(pg,meta);
-    // Use stored summary from page data
+  useEffect(()=>{if(sRef.current){sRef.current.scrollTop=0;setScrollPct(0)};setSummaryLoading(false);setNoteOpen(false);updateSEO(pg,meta);},[act]);
+  // Load summary from page data — reacts to both page navigation and data loading
+  useEffect(()=>{
     if(pg?.summary) setSummary(pg.summary);
     else setSummary(null);
-  },[act]);
+  },[act, pg?.summary]);
   const allP = Object.values(pages);
 
   const searchResults = q ? (()=>{
